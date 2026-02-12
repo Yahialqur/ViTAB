@@ -764,7 +764,7 @@ def parse_args():
     parser.add_argument(
         '--jsonl-path',
         type=str,
-        default='/scratch/pbiswa11/Downloads/visualcite.jsonl',
+        default='../visualcite.jsonl',
         help='Path to the VisualCite JSONL dataset file (default: ../visualcite.jsonl)'
     )
 
