@@ -1,8 +1,8 @@
 """Shared helpers for working with VisualCite table JSON.
 
 These helpers are intentionally dependency-free so they can be used from both:
-- script-style execution (e.g., `cd qwen; python benchmark_runner.py`)
-- package-style execution (e.g., `python -m qwen.benchmark_runner`)
+- script-style execution (e.g., `cd src; python benchmark_runner.py`)
+- package-style execution (e.g., `python -m src.benchmark_runner`)
 """
 
 from typing import Any, Dict, List

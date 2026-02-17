@@ -110,7 +110,7 @@ def test_prompt_builder():
     builder = PromptBuilder()
     
     # Test zero-shot
-    prompt_zs = builder.build_prompt(
+    prompt_zs, example_img_zs = builder.build_prompt(
         sample=sample,
         strategy=PromptStrategy.ZERO_SHOT,
         representation=DataRepresentation.MARKDOWN,
@@ -118,26 +118,30 @@ def test_prompt_builder():
     )
     assert "ATTRIBUTED CELLS:" in prompt_zs
     assert sample.question in prompt_zs
+    assert example_img_zs is None
     logger.info("✓ Zero-shot prompt generated")
     
     # Test few-shot
-    prompt_fs = builder.build_prompt(
+    prompt_fs, example_img_fs = builder.build_prompt(
         sample=sample,
         strategy=PromptStrategy.FEW_SHOT,
         representation=DataRepresentation.MARKDOWN,
         table_content=sample.table_md
     )
-    assert "EXAMPLE 1:" in prompt_fs
+    assert "EXAMPLE:" in prompt_fs
+    assert isinstance(prompt_fs, str)
+    assert example_img_fs is None
     logger.info("✓ Few-shot prompt generated")
     
     # Test CoT
-    prompt_cot = builder.build_prompt(
+    prompt_cot, example_img_cot = builder.build_prompt(
         sample=sample,
         strategy=PromptStrategy.CHAIN_OF_THOUGHT,
         representation=DataRepresentation.MARKDOWN,
         table_content=sample.table_md
     )
     assert "step by step" in prompt_cot.lower()
+    assert example_img_cot is None
     logger.info("✓ Chain-of-thought prompt generated")
     
     return True

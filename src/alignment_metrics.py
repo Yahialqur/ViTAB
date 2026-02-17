@@ -23,7 +23,7 @@ import numpy as np
 from scipy import stats
 
 try:
-    # Package import (e.g., `python -m qwen...`)
+    # Package import (e.g., `python -m src.benchmark_runner`)
     from .confidence_types import (
         ConfidenceResult,
         AlignmentMetrics,
@@ -32,7 +32,7 @@ try:
         classify_alignment,
     )
 except ImportError:  # pragma: no cover
-    # Script import (e.g., `cd qwen; python benchmark_runner.py`)
+    # Script import (e.g., `cd src; python benchmark_runner.py`)
     from confidence_types import (
         ConfidenceResult,
         AlignmentMetrics,

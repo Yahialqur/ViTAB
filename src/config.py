@@ -6,16 +6,25 @@ from typing import List, Dict, Optional
 from enum import Enum
 
 
-
 class ModelSize(Enum):
     """Model identifiers for benchmark runs"""
+    # Gemma family
     GEMMA_4B = "google/gemma-3-4b-it"
     GEMMA_12B = "google/gemma-3-12b-it"
     GEMMA_27B = "google/gemma-3-27b-it"
+    # InternVL 3.5 family
     INTERNVL35_4B = "OpenGVLab/InternVL3_5-4B-hf"
     INTERNVL35_8B = "OpenGVLab/InternVL3_5-8B-hf"
     INTERNVL35_14B = "OpenGVLab/InternVL3_5-14B-hf"
     INTERNVL35_38B = "OpenGVLab/InternVL3_5-38B-hf"
+    # Qwen3-VL family
+    VL_2B = "Qwen/Qwen3-VL-2B-Instruct"
+    VL_4B = "Qwen/Qwen3-VL-4B-Instruct"
+    VL_8B = "Qwen/Qwen3-VL-8B-Instruct"
+    VL_32B = "Qwen/Qwen3-VL-32B-Instruct"
+    # Molmo2 family
+    MOLMO2_4B = "allenai/Molmo2-4B"
+    MOLMO2_8B = "allenai/Molmo2-8B"
 
 
 class DataRepresentation(Enum):
@@ -44,17 +53,15 @@ class BenchmarkConfig:
     dataset_split: str = "dev"  # Use dev split for benchmarking
     max_samples: Optional[int] = 200  # Limit to 200 samples
     single_cell_only: bool = True  # Only load samples with exactly one ground truth cell
-    
+
     # Model settings
     models: List[str] = field(default_factory=lambda: [
-        # InternVL 3.5 IT family (requested default)
-        ModelSize.INTERNVL35_4B.value,
-        ModelSize.INTERNVL35_8B.value,
-        ModelSize.INTERNVL35_14B.value,
-        ModelSize.INTERNVL35_38B.value,
+        ModelSize.VL_2B.value,
+        ModelSize.VL_4B.value,
+        ModelSize.VL_8B.value,
+        ModelSize.VL_32B.value,
     ])
 
-    
     # Data representations to test
     representations: List[DataRepresentation] = field(default_factory=lambda: [
         DataRepresentation.JSON,
@@ -65,14 +72,14 @@ class BenchmarkConfig:
         DataRepresentation.IMAGE_BLUE,
         DataRepresentation.IMAGE_GREEN,
     ])
-    
+
     # Prompt strategies
     strategies: List[PromptStrategy] = field(default_factory=lambda: [
         PromptStrategy.ZERO_SHOT,
         PromptStrategy.FEW_SHOT,
         PromptStrategy.CHAIN_OF_THOUGHT,
     ])
-    
+
     # Generation settings
     max_new_tokens: int = 512
     temperature: float = 0.1
@@ -90,12 +97,12 @@ class BenchmarkConfig:
     conformal_calibration_ratio: float = 0.5
     conformal_alpha: float = 0.1
     conformal_seed: int = 42
-    
+
     # Output settings
     output_dir: str = "benchmark_results"
     checkpoint_dir: str = "checkpoints"
     log_level: str = "INFO"
-    
+
     # Hardware settings
     device: str = "cuda"
     torch_dtype: str = "bfloat16"

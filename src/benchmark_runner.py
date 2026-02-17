@@ -32,7 +32,7 @@ from data_loader import (
     extract_cells_from_formulas,
     get_json_table_as_readable
 )
-from model_handler import ModelManager, Qwen3VLModel, InferenceResult
+from model_handler import ModelManager, InferenceResult
 from prompt_builder import PromptBuilder
 from metrics import (
     evaluate_single_prediction,
@@ -100,7 +100,7 @@ class BenchmarkRunner:
     
     def run_single_inference(
         self,
-        model: Qwen3VLModel,
+        model: Any,
         sample: VisualCiteSample,
         representation: DataRepresentation,
         strategy: PromptStrategy,

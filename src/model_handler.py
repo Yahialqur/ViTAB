@@ -1,5 +1,8 @@
 """
-Model handler for Qwen3-VL models
+Unified model handler for all supported vision-language models.
+
+Supports: Gemma, InternVL 3.5, Qwen3-VL, and Molmo2.
+Routes to the correct handler class based on the model name.
 """
 import time
 import logging
@@ -10,6 +13,24 @@ from PIL import Image
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+def _detect_model_family(model_name: str) -> str:
+    """Detect which model family a HuggingFace model ID belongs to.
+
+    Returns:
+        "internvl" for InternVL and Gemma models
+        "qwen" for Qwen3-VL and Molmo2 models
+    """
+    name_lower = model_name.lower()
+    if "internvl" in name_lower or "gemma" in name_lower:
+        return "internvl"
+    if "qwen" in name_lower or "molmo" in name_lower:
+        return "qwen"
+    raise ValueError(
+        f"Cannot detect model family for '{model_name}'. "
+        "Expected model name to contain one of: internvl, gemma, qwen, molmo."
+    )
 
 
 def _summarize_hf_device_map(device_map: Any) -> Dict[str, int]:
@@ -96,9 +117,349 @@ class InferenceResult:
     generated_token_ids: Optional[List[int]] = None  # All generated token IDs
 
 
+# ---------------------------------------------------------------------------
+# InternVL / Gemma handler
+# ---------------------------------------------------------------------------
+
+class InternVLModel:
+    """Handler for InternVL and Gemma models, following official HF documentation"""
+
+    def __init__(
+        self,
+        model_name: str,
+        device: str = "cuda",
+        torch_dtype: str = "bfloat16",
+        use_flash_attention: bool = False,
+        use_torch_compile: bool = False,
+        max_new_tokens: int = 512,
+        temperature: float = 0.1,
+        do_sample: bool = False
+    ):
+        self.model_name = model_name
+        self.device = device
+        self.torch_dtype = getattr(torch, torch_dtype)
+        self.use_flash_attention = use_flash_attention
+        self.use_torch_compile = use_torch_compile
+        self.max_new_tokens = max_new_tokens
+        self.temperature = temperature
+        self.do_sample = do_sample
+
+        self.model = None
+        self.processor = None
+        self._loaded = False
+
+    def load(self) -> None:
+        """Load InternVL model and processor following official documentation"""
+        if self._loaded:
+            return
+
+        from transformers import AutoProcessor, AutoModelForImageTextToText
+
+        logger.info(f"Loading InternVL model: {self.model_name}")
+
+        # Load processor (trust_remote_code required for InternVL)
+        self.processor = AutoProcessor.from_pretrained(
+            self.model_name,
+            trust_remote_code=True
+        )
+
+        # Load model using InternVL's image-text generation class
+        self.model = AutoModelForImageTextToText.from_pretrained(
+            self.model_name,
+            device_map="auto",
+            torch_dtype=self.torch_dtype,
+            trust_remote_code=True
+        ).eval()
+
+        # Log device placement and potential offloading (cpu/disk) for verification.
+        _log_runtime_device_info(self.model)
+
+        # Apply torch.compile if enabled
+        if self.use_torch_compile:
+            logger.info("Compiling model with torch.compile()...")
+            self.model = torch.compile(self.model, mode="reduce-overhead")
+            logger.info("Model compilation complete")
+
+        self._loaded = True
+        logger.info(f"InternVL model loaded successfully: {self.model_name}")
+
+    def unload(self) -> None:
+        """Unload model from memory"""
+        if self.model is not None:
+            del self.model
+            self.model = None
+        if self.processor is not None:
+            del self.processor
+            self.processor = None
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        self._loaded = False
+        logger.info(f"Model unloaded: {self.model_name}")
+
+    def generate_text_only(
+        self,
+        prompt: str,
+        return_logits: bool = False
+    ) -> InferenceResult:
+        """
+        Text-only generation for InternVL (JSON/Markdown representations).
+        """
+        if not self._loaded:
+            self.load()
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt}
+                ]
+            }
+        ]
+
+        inputs = self.processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt"
+        )
+
+        inputs = inputs.to(self.model.device)
+
+        raw_input = {
+            "type": "text_only",
+            "prompt": prompt,
+        }
+
+        start_time = time.perf_counter()
+
+        all_token_logits = None
+        token_probs = None
+
+        with torch.no_grad():
+            if return_logits:
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=self.max_new_tokens,
+                    temperature=self.temperature if self.do_sample else None,
+                    do_sample=self.do_sample,
+                    pad_token_id=self.processor.tokenizer.pad_token_id,
+                    output_scores=True,
+                    return_dict_in_generate=True
+                )
+                generated_ids = outputs.sequences
+
+                if outputs.scores:
+                    all_token_logits = torch.stack(
+                        [s[0].float().cpu() for s in outputs.scores],
+                        dim=0
+                    )
+
+                    probs = F.softmax(outputs.scores[0][0], dim=-1)
+                    top_k = 100
+                    top_probs, top_indices = torch.topk(probs, top_k)
+                    token_probs = {
+                        int(idx): float(prob)
+                        for idx, prob in zip(top_indices.tolist(), top_probs.tolist())
+                    }
+            else:
+                generated_ids = self.model.generate(
+                    **inputs,
+                    max_new_tokens=self.max_new_tokens,
+                    temperature=self.temperature if self.do_sample else None,
+                    do_sample=self.do_sample,
+                    pad_token_id=self.processor.tokenizer.pad_token_id
+                )
+
+        end_time = time.perf_counter()
+        inference_time_ms = (end_time - start_time) * 1000
+
+        generated_ids_trimmed = [
+            out_ids[len(in_ids):]
+            for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
+
+        gen_tokens_list = generated_ids_trimmed[0].tolist() if generated_ids_trimmed else []
+
+        output_text = self.processor.batch_decode(
+            generated_ids_trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False
+        )[0]
+
+        return InferenceResult(
+            output_text=output_text.strip(),
+            inference_time_ms=inference_time_ms,
+            input_tokens=inputs.input_ids.shape[1],
+            output_tokens=len(gen_tokens_list),
+            raw_input=raw_input,
+            logits=all_token_logits,
+            token_probabilities=token_probs,
+            generated_token_ids=gen_tokens_list
+        )
+
+    def generate_with_image(
+        self,
+        prompt: str,
+        image: Image.Image,
+        example_image: Optional[Image.Image] = None,
+        return_logits: bool = False
+    ) -> InferenceResult:
+        """
+        Generate response for image + text input following official InternVL documentation.
+        """
+        if not self._loaded:
+            self.load()
+
+        content = []
+        if example_image is not None:
+            if "<IMAGE>" not in prompt:
+                raise ValueError(
+                    "Few-shot image prompting requires exactly two <IMAGE> markers in the prompt "
+                    "to place example and main images."
+                )
+
+            parts = prompt.split("<IMAGE>")
+            if len(parts) != 3:
+                raise ValueError(
+                    f"Expected exactly two <IMAGE> markers, found {len(parts) - 1}."
+                )
+
+            content.append({"type": "text", "text": parts[0]})
+            content.append({"type": "image", "image": example_image})
+            content.append({"type": "text", "text": parts[1]})
+            content.append({"type": "image", "image": image})
+            content.append({"type": "text", "text": parts[2]})
+            logger.info(
+                "Multi-image message structure: "
+                f"[text, example_image({example_image.size}), text, main_image({image.size}), text]"
+            )
+        else:
+            if "<IMAGE>" in prompt:
+                raise ValueError(
+                    "Prompt contains <IMAGE> markers but no example image was provided."
+                )
+            content.append({"type": "image", "image": image})
+            content.append({"type": "text", "text": prompt})
+            logger.debug(f"Single image: size={image.size}")
+
+        messages = [
+            {
+                "role": "user",
+                "content": content
+            }
+        ]
+
+        inputs = self.processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt"
+        )
+
+        # Move to device (do NOT pass dtype to .to() - BatchEncoding doesn't support it)
+        inputs = inputs.to(self.model.device)
+
+        # Manually cast pixel_values to the correct dtype if present
+        if "pixel_values" in inputs and hasattr(inputs["pixel_values"], "to"):
+            inputs["pixel_values"] = inputs["pixel_values"].to(dtype=self.torch_dtype)
+
+        raw_input = {
+            "type": "image_text",
+            "prompt": prompt,
+            "image_size": image.size,
+            "image_mode": image.mode
+        }
+
+        start_time = time.perf_counter()
+
+        all_token_logits = None
+        token_probs = None
+
+        with torch.no_grad():
+            if return_logits:
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=self.max_new_tokens,
+                    temperature=self.temperature if self.do_sample else None,
+                    do_sample=self.do_sample,
+                    pad_token_id=self.processor.tokenizer.pad_token_id,
+                    output_scores=True,
+                    return_dict_in_generate=True
+                )
+                generated_ids = outputs.sequences
+
+                if outputs.scores:
+                    all_token_logits = torch.stack(
+                        [s[0].float().cpu() for s in outputs.scores],
+                        dim=0
+                    )
+
+                    probs = F.softmax(outputs.scores[0][0], dim=-1)
+                    top_k = 100
+                    top_probs, top_indices = torch.topk(probs, top_k)
+                    token_probs = {
+                        int(idx): float(prob)
+                        for idx, prob in zip(top_indices.tolist(), top_probs.tolist())
+                    }
+            else:
+                generated_ids = self.model.generate(
+                    **inputs,
+                    max_new_tokens=self.max_new_tokens,
+                    temperature=self.temperature if self.do_sample else None,
+                    do_sample=self.do_sample,
+                    pad_token_id=self.processor.tokenizer.pad_token_id
+                )
+
+        end_time = time.perf_counter()
+        inference_time_ms = (end_time - start_time) * 1000
+
+        generated_ids_trimmed = [
+            out_ids[len(in_ids):]
+            for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
+
+        gen_tokens_list = generated_ids_trimmed[0].tolist() if generated_ids_trimmed else []
+
+        output_text = self.processor.batch_decode(
+            generated_ids_trimmed,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False
+        )[0]
+
+        return InferenceResult(
+            output_text=output_text.strip(),
+            inference_time_ms=inference_time_ms,
+            input_tokens=inputs.input_ids.shape[1],
+            output_tokens=len(gen_tokens_list),
+            raw_input=raw_input,
+            logits=all_token_logits,
+            token_probabilities=token_probs,
+            generated_token_ids=gen_tokens_list
+        )
+
+    def generate(
+        self,
+        prompt: str,
+        image: Optional[Image.Image] = None,
+        return_logits: bool = False
+    ) -> InferenceResult:
+        """Unified generate method for InternVL/Gemma inputs."""
+        if image is None:
+            return self.generate_text_only(prompt, return_logits=return_logits)
+        return self.generate_with_image(prompt, image, return_logits=return_logits)
+
+
+# ---------------------------------------------------------------------------
+# Qwen3-VL / Molmo2 handler
+# ---------------------------------------------------------------------------
+
 class Qwen3VLModel:
-    """Handler for Qwen3-VL models"""
-    
+    """Handler for Qwen3-VL and Molmo2 models"""
+
     def __init__(
         self,
         model_name: str,
@@ -122,7 +483,7 @@ class Qwen3VLModel:
         self.model = None
         self.processor = None
         self._loaded = False
-    
+
     def load(self) -> None:
         """Load model and processor"""
         if self._loaded:
@@ -135,11 +496,11 @@ class Qwen3VLModel:
         trust_remote_code = False
         # Detect if this is a Molmo2 model
         is_molmo2 = "molmo2" in self.model_name.lower()
-        
+
         if "30b" in self.model_name.lower() or "a3b" in self.model_name.lower():
             logger.info(f"Enabling trust_remote_code=True for {self.model_name}")
             trust_remote_code = True
-        
+
         # Molmo2 models require trust_remote_code
         if is_molmo2:
             logger.info(f"Detected Molmo2 model, enabling trust_remote_code=True")
@@ -149,9 +510,8 @@ class Qwen3VLModel:
         if is_molmo2:
             logger.info("Using AutoModelForImageTextToText for Molmo2 model with dtype='auto'")
             from transformers import AutoModelForImageTextToText
-            
+
             # Molmo2 models require dtype="auto" as string (not torch dtype object)
-            # Following official example from allenai/Molmo2
             try:
                 self.model = AutoModelForImageTextToText.from_pretrained(
                     self.model_name,
@@ -172,11 +532,9 @@ class Qwen3VLModel:
         else:
             logger.info("Using Qwen3VLForConditionalGeneration for Qwen model")
             from transformers import Qwen3VLForConditionalGeneration
-            
-            # Use dtype="auto" for automatic dtype selection as recommended
+
             try:
                 if self.use_flash_attention:
-                    # Try with flash attention
                     self.model = Qwen3VLForConditionalGeneration.from_pretrained(
                         self.model_name,
                         dtype=self.torch_dtype,
@@ -185,7 +543,6 @@ class Qwen3VLModel:
                         trust_remote_code=trust_remote_code
                     )
                 else:
-                    # Use default attention (SDPA)
                     self.model = Qwen3VLForConditionalGeneration.from_pretrained(
                         self.model_name,
                         dtype=self.torch_dtype,
@@ -194,7 +551,6 @@ class Qwen3VLModel:
                     )
             except Exception as e:
                 logger.warning(f"Failed to load with specified settings, trying with dtype='auto': {e}")
-                # Fallback: use dtype="auto" as in the example
                 self.model = Qwen3VLForConditionalGeneration.from_pretrained(
                     self.model_name,
                     dtype="auto",
@@ -204,7 +560,6 @@ class Qwen3VLModel:
 
         # Load processor with appropriate parameters
         if is_molmo2:
-            # Molmo2 processor also needs dtype="auto" and device_map="auto"
             try:
                 self.processor = AutoProcessor.from_pretrained(
                     self.model_name,
@@ -239,7 +594,7 @@ class Qwen3VLModel:
 
         self._loaded = True
         logger.info(f"Model loaded successfully: {self.model_name}")
-    
+
     def unload(self) -> None:
         """Unload model from memory"""
         if self.model is not None:
@@ -248,13 +603,13 @@ class Qwen3VLModel:
         if self.processor is not None:
             del self.processor
             self.processor = None
-        
+
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        
+
         self._loaded = False
         logger.info(f"Model unloaded: {self.model_name}")
-    
+
     def generate_text_only(
         self,
         prompt: str,
@@ -265,8 +620,7 @@ class Qwen3VLModel:
         """
         if not self._loaded:
             self.load()
-        
-        # Prepare messages for text-only input
+
         messages = [
             {
                 "role": "user",
@@ -275,8 +629,7 @@ class Qwen3VLModel:
                 ]
             }
         ]
-        
-        # Apply chat template and tokenize
+
         inputs = self.processor.apply_chat_template(
             messages,
             tokenize=True,
@@ -287,24 +640,20 @@ class Qwen3VLModel:
             max_length=None
         )
         inputs = inputs.to(self.model.device)
-        
-        # Store raw input for logging
+
         raw_input = {
             "type": "text_only",
             "prompt": prompt,
             "messages": messages
         }
-        
-        # Generate
+
         start_time = time.perf_counter()
 
-        # For confidence extraction, we need to get logits
         all_token_logits = None
         token_probs = None
 
         with torch.no_grad():
             if return_logits:
-                # Generate with output_scores to get logits for confidence extraction
                 outputs = self.model.generate(
                     **inputs,
                     max_new_tokens=self.max_new_tokens,
@@ -316,15 +665,12 @@ class Qwen3VLModel:
                 )
                 generated_ids = outputs.sequences
 
-                # Stack all token logits for confidence calculation [seq_len, vocab_size]
                 if outputs.scores:
-                    # Move to CPU and cast to float32 immediately to prevent VRAM OOM
                     all_token_logits = torch.stack(
-                        [s[0].float().cpu() for s in outputs.scores], 
+                        [s[0].float().cpu() for s in outputs.scores],
                         dim=0
                     )
-                    
-                    # Also compute first-token probabilities for backwards compatibility
+
                     probs = F.softmax(outputs.scores[0][0], dim=-1)
                     top_k = 100
                     top_probs, top_indices = torch.topk(probs, top_k)
@@ -344,13 +690,11 @@ class Qwen3VLModel:
         end_time = time.perf_counter()
         inference_time_ms = (end_time - start_time) * 1000
 
-        # Decode output
         generated_ids_trimmed = [
             out_ids[len(in_ids):]
             for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
         ]
-        
-        # Safe extraction of tokens list
+
         gen_tokens_list = generated_ids_trimmed[0].tolist() if generated_ids_trimmed else []
 
         output_text = self.processor.batch_decode(
@@ -379,29 +723,15 @@ class Qwen3VLModel:
     ) -> InferenceResult:
         """
         Generate response for image + text input.
-        
-        Args:
-            prompt: The text prompt
-            image: The main table image
-            example_image: Optional example image for few-shot prompting
-            return_logits: Whether to return logits for confidence extraction
-        
-        Returns:
-            InferenceResult with output and optional logits
         """
         if not self._loaded:
             self.load()
-        
-        # Prepare messages with image + text (following Qwen3-VL example)
-        # For few-shot with example image, include it before the main prompt
+
         content = []
         if example_image is not None:
-            # For few-shot with images, the prompt has <IMAGE> markers where images should go
             if "<IMAGE>" in prompt:
-                # Split prompt at <IMAGE> markers and insert images
                 parts = prompt.split("<IMAGE>")
-                if len(parts) == 3:  # Should have: [before_ex, middle, after_main]
-                    # Structure: text -> example_image -> text -> main_image -> text
+                if len(parts) == 3:
                     content.append({"type": "text", "text": parts[0]})
                     content.append({"type": "image", "image": example_image})
                     content.append({"type": "text", "text": parts[1]})
@@ -409,44 +739,39 @@ class Qwen3VLModel:
                     content.append({"type": "text", "text": parts[2]})
                     logger.info(f"Multi-image message structure: [text, example_image({example_image.size}), text, main_image({image.size}), text]")
                 else:
-                    # Unexpected format, fallback
                     logger.warning(f"Unexpected <IMAGE> marker count: {len(parts)-1}")
                     content.append({"type": "image", "image": example_image})
                     content.append({"type": "image", "image": image})
                     content.append({"type": "text", "text": prompt.replace("<IMAGE>", "")})
                     logger.info(f"Multi-image fallback: [example_image({example_image.size}), main_image({image.size}), text]")
             else:
-                # Old format with "Now analyze this table:" split (for text few-shot)
                 if "Now analyze this table:" in prompt:
                     parts = prompt.split("Now analyze this table:")
                     example_part = parts[0]
                     main_part = "Now analyze this table:" + parts[1]
-                    
+
                     content.append({"type": "image", "image": example_image})
                     content.append({"type": "text", "text": example_part})
                     content.append({"type": "image", "image": image})
                     content.append({"type": "text", "text": main_part})
                     logger.info(f"Text-based few-shot with images: [example_image({example_image.size}), text, main_image({image.size}), text]")
                 else:
-                    # Fallback: just put example image first, then main image with full prompt
                     content.append({"type": "image", "image": example_image})
                     content.append({"type": "image", "image": image})
                     content.append({"type": "text", "text": prompt})
                     logger.info(f"Few-shot fallback: [example_image({example_image.size}), main_image({image.size}), text]")
         else:
-            # Single image case (zero-shot or CoT)
             content.append({"type": "image", "image": image})
             content.append({"type": "text", "text": prompt})
             logger.debug(f"Single image: size={image.size}")
-        
+
         messages = [
             {
                 "role": "user",
                 "content": content
             }
         ]
-        
-        # Apply chat template and tokenize with image
+
         inputs = self.processor.apply_chat_template(
             messages,
             tokenize=True,
@@ -457,25 +782,21 @@ class Qwen3VLModel:
             max_length=None
         )
         inputs = inputs.to(self.model.device)
-        
-        # Store raw input for logging (without the actual image data)
+
         raw_input = {
             "type": "image_text",
             "prompt": prompt,
             "image_size": image.size,
             "image_mode": image.mode
         }
-        
-        # Generate
+
         start_time = time.perf_counter()
 
-        # For confidence extraction, we need to get logits
         all_token_logits = None
         token_probs = None
 
         with torch.no_grad():
             if return_logits:
-                # Generate with output_scores to get logits for confidence extraction
                 outputs = self.model.generate(
                     **inputs,
                     max_new_tokens=self.max_new_tokens,
@@ -487,15 +808,12 @@ class Qwen3VLModel:
                 )
                 generated_ids = outputs.sequences
 
-                # Stack all token logits for confidence calculation [seq_len, vocab_size]
                 if outputs.scores:
-                    # Move to CPU and cast to float32 immediately to prevent VRAM OOM
                     all_token_logits = torch.stack(
-                        [s[0].float().cpu() for s in outputs.scores], 
+                        [s[0].float().cpu() for s in outputs.scores],
                         dim=0
                     )
-                    
-                    # Also compute first-token probabilities for backwards compatibility
+
                     probs = F.softmax(outputs.scores[0][0], dim=-1)
                     top_k = 100
                     top_probs, top_indices = torch.topk(probs, top_k)
@@ -515,12 +833,11 @@ class Qwen3VLModel:
         end_time = time.perf_counter()
         inference_time_ms = (end_time - start_time) * 1000
 
-        # Decode output
         generated_ids_trimmed = [
             out_ids[len(in_ids):]
             for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
         ]
-        
+
         gen_tokens_list = generated_ids_trimmed[0].tolist() if generated_ids_trimmed else []
 
         output_text = self.processor.batch_decode(
@@ -546,65 +863,79 @@ class Qwen3VLModel:
         image: Optional[Image.Image] = None,
         return_logits: bool = False
     ) -> InferenceResult:
-        """
-        Unified generate method that handles both text-only and image+text inputs
-
-        Args:
-            prompt: The text prompt
-            image: Optional PIL Image for multimodal input
-            return_logits: If True, return token logits for confidence extraction
-
-        Returns:
-            InferenceResult with output text and optionally logits/probabilities
-        """
+        """Unified generate method for Qwen3-VL/Molmo2 inputs."""
         if image is not None:
-            # FIX: Explicitly pass kwargs to avoid passing return_logits into example_image
             return self.generate_with_image(
-                prompt=prompt, 
-                image=image, 
-                example_image=None, 
+                prompt=prompt,
+                image=image,
+                example_image=None,
                 return_logits=return_logits
             )
         else:
             return self.generate_text_only(prompt, return_logits)
 
+
+# ---------------------------------------------------------------------------
+# Unified ModelManager with automatic routing
+# ---------------------------------------------------------------------------
+
 class ModelManager:
-    """Manager for loading/unloading multiple models efficiently"""
-    
+    """Manager for loading/unloading multiple models efficiently.
+
+    Automatically detects the model family from the HuggingFace model ID
+    and instantiates the appropriate handler class.
+    """
+
     def __init__(self, config: Any):
         self.config = config
-        self.current_model: Optional[Qwen3VLModel] = None
+        self.current_model: Optional[Union[InternVLModel, Qwen3VLModel]] = None
         self.current_model_name: Optional[str] = None
-    
-    def get_model(self, model_name: str) -> Qwen3VLModel:
+
+    def get_model(self, model_name: str) -> Union[InternVLModel, Qwen3VLModel]:
         """
         Get a model, loading it if necessary and unloading the previous one.
+        Automatically routes to the correct handler class based on model name.
         """
         if self.current_model_name == model_name and self.current_model is not None:
             return self.current_model
-        
+
         # Unload current model if any
         if self.current_model is not None:
             logger.info(f"Unloading model: {self.current_model_name}")
             self.current_model.unload()
-        
-        # Load new model
-        logger.info(f"Loading model: {model_name}")
-        self.current_model = Qwen3VLModel(
-            model_name=model_name,
-            device=self.config.device,
-            torch_dtype=self.config.torch_dtype,
-            use_flash_attention=self.config.use_flash_attention,
-            use_torch_compile=self.config.use_torch_compile,
-            max_new_tokens=self.config.max_new_tokens,
-            temperature=self.config.temperature,
-            do_sample=self.config.do_sample
-        )
+
+        # Detect model family and instantiate appropriate handler
+        family = _detect_model_family(model_name)
+        logger.info(f"Loading model: {model_name} (family: {family})")
+
+        if family == "internvl":
+            self.current_model = InternVLModel(
+                model_name=model_name,
+                device=self.config.device,
+                torch_dtype=self.config.torch_dtype,
+                use_flash_attention=self.config.use_flash_attention,
+                use_torch_compile=self.config.use_torch_compile,
+                max_new_tokens=self.config.max_new_tokens,
+                temperature=self.config.temperature,
+                do_sample=self.config.do_sample
+            )
+        else:  # "qwen"
+            self.current_model = Qwen3VLModel(
+                model_name=model_name,
+                device=self.config.device,
+                torch_dtype=self.config.torch_dtype,
+                use_flash_attention=self.config.use_flash_attention,
+                use_torch_compile=self.config.use_torch_compile,
+                max_new_tokens=self.config.max_new_tokens,
+                temperature=self.config.temperature,
+                do_sample=self.config.do_sample
+            )
+
         self.current_model.load()
         self.current_model_name = model_name
-        
+
         return self.current_model
-    
+
     def cleanup(self):
         """Cleanup all resources"""
         if self.current_model is not None:

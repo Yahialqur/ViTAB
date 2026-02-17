@@ -31,7 +31,7 @@ from .data_loader import (
     parse_model_output,
     get_json_table_as_readable,
 )
-from .model_handler import Qwen3VLModel, ModelManager, InferenceResult
+from .model_handler import ModelManager, InferenceResult
 from .metrics import evaluate_single_prediction, CellMetrics
 from .confidence_types import (
     ConfidenceResult,
@@ -162,7 +162,7 @@ class ConfidenceBenchmarkRunner:
     def run_single_sample_confidence(
         self,
         sample: VisualCiteSample,
-        model: Qwen3VLModel,
+        model: Any,
         representation: DataRepresentation
     ) -> CellConfidenceResult:
         """
